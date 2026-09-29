@@ -254,7 +254,7 @@ describe('Cache Integration', () => {
       const retryCache = createCache({
         backend: flakeyBackend,
         reliability: {
-          retry: { maxAttempts: 3, baseDelayMs: 10 },
+          retry: { maxAttempts: 3, baseDelay: 10 },
         },
         l1: { enabled: false }, // Disable L1 to force backend access
       });
@@ -1381,7 +1381,7 @@ describe('Binary values (LAB-4839)', () => {
         calls++;
         return bytes(n);
       },
-      { namespace: 'bin:fn' }
+      { namespace: 'bin:fn', ttl: 60 }
     );
     expectSameBytes(await cached(20_000), bytes(20_000));
     expectSameBytes(await cached(20_000), bytes(20_000));
