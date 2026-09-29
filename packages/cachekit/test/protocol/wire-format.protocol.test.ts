@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { decode } from '@msgpack/msgpack';
 import { ByteStorage } from '@cachekit-io/cachekit-core-ts';
+import { readEnvelopeHeader } from '../../src/serialization/envelope.js';
 // Single vendored copy of protocol/test-vectors/wire-format.json (see the
 // workers lane header for the re-copy rule); this lane runs the same vectors
 // through the NAPI binding so both bindings are held to identical bytes.
@@ -260,6 +261,85 @@ describe('Protocol v1.1 Wire Format (ByteStorage)', () => {
         expect(packed[1]).toBe(expectedBinMarker(compressedData(packed).length));
         expect(bs.unpack(packed)).toEqual(payload);
       }
+    });
+  });
+
+  // The SDK reads original_size itself so it can refuse an oversized envelope
+  // before unpack allocates it. It must agree with core on every conforming
+  // envelope — both encodings — or a legitimate entry would stop reading.
+  describe('readEnvelopeHeader (pre-unpack header read)', () => {
+    const declared = (bytes: Uint8Array) => readEnvelopeHeader(bytes)?.declaredSize ?? null;
+
+    it.each(vectors.map((v) => [v.name, v] as const))(
+      'reads original_size from ground-truth envelope %s',
+      (_name, vector) => {
+        expect(declared(hexToBytes(vector.envelope_hex))).toBe(vector.input_hex.length / 2);
+      }
+    );
+
+    it('reads original_size and compressed length from fresh packs across every uint width', () => {
+      for (const size of [0, 1, 127, 128, 255, 256, 65535, 65536, 200_000]) {
+        const payload = new Uint8Array(size);
+        for (let i = 0; i < size; i++) payload[i] = (i * 131 + 17) & 0xff;
+        const packed = bs.pack(payload);
+        const header = readEnvelopeHeader(packed);
+        expect(header?.declaredSize).toBe(size);
+        // envelopeVerdict refuses anything past lz4_flex's worst case; the
+        // real writer must stay inside it, even on incompressible input.
+        expect(header!.compressedLength).toBeGreaterThan(0);
+        expect(header!.compressedLength).toBeLessThanOrEqual(20 + Math.floor((size * 110) / 100));
+      }
+    });
+
+    it('returns null for every truncation, and for trailing bytes', () => {
+      const packed = bs.pack(new TextEncoder().encode('truncation walk'));
+      for (let len = 0; len < packed.length; len++) {
+        expect(declared(packed.subarray(0, len))).toBeNull();
+      }
+      expect(declared(packed)).toBe(15);
+      const padded = new Uint8Array(packed.length + 1);
+      padded.set(packed);
+      expect(declared(padded)).toBeNull();
+    });
+
+    it('requires format to be a short UTF-8 str or bin, as core decodes it', () => {
+      // [bin(0), [8 x 0], 0, <format>]: only the format slot varies.
+      const head = [0x94, 0xc4, 0x00, 0x98, 0, 0, 0, 0, 0, 0, 0, 0, 0x00];
+      const withFormat = (tail: number[]) => declared(new Uint8Array([...head, ...tail]));
+      const text = (n: number) => Array.from({ length: n }, () => 0x61);
+
+      expect(withFormat([0xa1, 0x61])).toBe(0); // fixstr
+      expect(withFormat([0xd9, 64, ...text(64)])).toBe(0); // str8 at the cap
+      expect(withFormat([0xc4, 1, 0x61])).toBe(0); // bin: serde's String takes it
+      expect(withFormat([0xd9, 65, ...text(65)])).toBeNull(); // over the cap
+      expect(withFormat([0xa1, 0xff])).toBeNull(); // invalid UTF-8
+      for (const tail of [[0x00], [0xc0], [0xcb, 0, 0, 0, 0, 0, 0, 0, 0], [0x81, 0xa1, 0x61, 1]]) {
+        expect(withFormat(tail)).toBeNull(); // int, nil, float, map
+      }
+    });
+
+    it('returns null for shapes no conforming writer emits', () => {
+      const cases: number[][] = [
+        [], // empty
+        [0x93, 0xc4, 0x00, 0x98, 0, 0, 0, 0, 0, 0, 0, 0, 0x00], // 3-tuple
+        [0x94, 0xa1, 0x41, 0x98, 0, 0, 0, 0, 0, 0, 0, 0, 0x00], // [0] is a str
+        [0x94, 0xc4, 0x00, 0x97, 0, 0, 0, 0, 0, 0, 0, 0x00], // 7-byte checksum
+        [0x94, 0xc4, 0x00, 0x98, 0, 0, 0, 0, 0, 0, 0, 0xcd, 0x01, 0x00, 0x00], // checksum byte > 0xff
+        [0x94, 0xc4, 0x00, 0x98, 0, 0, 0, 0, 0, 0, 0, 0, 0xd2, 0, 0, 0, 1], // int32 size
+        [0x94, 0xc4, 0x00, 0x98, 0, 0, 0, 0, 0, 0, 0, 0, 0xcf, 0, 0, 0, 0, 0, 0, 0, 1], // uint64 size
+        [0x94, 0xc4, 0x05, 0x00], // bin length runs past the end
+        [0x94, 0x91, 0xcd, 0x01, 0x00, 0x98, 0, 0, 0, 0, 0, 0, 0, 0, 0x00], // legacy byte > 0xff
+      ];
+      for (const bytes of cases) {
+        expect(readEnvelopeHeader(new Uint8Array(bytes))).toBeNull();
+      }
+    });
+
+    it('reads through a subarray view (non-zero byteOffset)', () => {
+      const packed = bs.pack(new TextEncoder().encode('offset'));
+      const padded = new Uint8Array(packed.length + 7);
+      padded.set(packed, 7);
+      expect(declared(padded.subarray(7))).toBe(6);
     });
   });
 });

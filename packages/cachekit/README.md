@@ -184,8 +184,10 @@ decoding materialises them into objects that cost several times their wire size
 in heap (a legal payload can inflate ~40×). Nested forged collection headers
 can no longer amplify unbounded — reads are structurally depth-bounded before
 the decoder allocates (LAB-2487) — but `maxDecodedSize` still sets the ceiling
-on a single untrusted decode's transient memory. Size it against your runtime's
-memory limit (and, on a shared/concurrent runtime, against peak concurrent
+on a single untrusted decode's transient memory. It also bounds decompression:
+an envelope that declares more than `maxDecodedSize`, or carries a payload too
+large for what it declares, is never unpacked, so the core codec never
+allocates for it. Size it against your runtime's memory limit (and, on a shared/concurrent runtime, against peak concurrent
 reads), not just your largest value: on a 128 MiB Workers isolate a 10 MiB cap
 already permits a multi-hundred-MiB transient.
 
@@ -202,14 +204,14 @@ value or key. Only a size rejection's line suggests raising the limits. The rate
 minute per cache, not per key. (An interop-mode rejection always throws to the
 caller instead, and only its size rejections are logged.)
 
-The line carries a non-reversible blake2b digest of the cache key rather than
-the key itself (keys are caller-controlled and may embed sensitive data); to
-match a digest to a suspect key, hash the key with blake2b (16-byte output,
-hex). This is the same digest the File backend
-uses as its on-disk filename, so on that backend a logged `keyHash` names the
-entry's cache file directly. (Backends have their own hard ceilings too:
-Workers KV values cap at 25 MiB, Memcached items at 1 MiB server-side,
-CachekitIO per plan.)
+The line, like every `keyHash=` line the SDK logs, carries a non-reversible
+blake2b digest of the cache key rather than the key itself (keys are
+caller-controlled and may embed sensitive data); to match a digest to a suspect
+key, hash the key with blake2b (16-byte output, hex). This is the same digest
+the File backend uses as its on-disk filename, so on that backend a logged
+`keyHash` names the entry's cache file directly. (Backends have their own hard
+ceilings too: Workers KV values cap at 25 MiB, Memcached items at 1 MiB
+server-side, CachekitIO per plan.)
 
 ### Binary values
 
@@ -545,8 +547,9 @@ silently. (On Cloudflare Workers, where prom-client cannot run, the `metrics`
 option degrades to a no-op the same way.)
 
 Internal error reporting (background refresh, invalidation channel, Redis
-connection events) defaults to `console.error`; route it into your own logging
-pipeline with `setLogger`:
+connection events, and read anomalies such as an envelope-shaped value that
+fails its integrity check on a compression-off cache) defaults to
+`console.error`; route it into your own logging pipeline with `setLogger`:
 
 ```typescript
 import { setLogger } from '@cachekit-io/cachekit';
