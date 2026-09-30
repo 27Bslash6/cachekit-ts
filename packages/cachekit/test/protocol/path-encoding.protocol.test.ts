@@ -98,9 +98,16 @@ describe('AC-0 repro — raw encodeURIComponent lets a dot-segment key escape /v
   });
 });
 
-describe('rule 2 — reserved segments are rejected before the URL is built', () => {
-  it('the vendored fixture reserves exactly the five spec tokens', () => {
-    expect(reserved.map((v) => v.key).sort()).toEqual(['.', '..', 'health', 'lock', 'ttl']);
+describe('rule 2 — reserved keys are rejected before the URL is built', () => {
+  // A floor, not the set: a re-vendored reject row runs through every loop below
+  // with no test edit, but a dropped row would take its loop coverage with it and
+  // let a regression in that key's guard pass. Vitest registers nothing for an
+  // empty `it.each` table, so the transmittable rows need the same guard.
+  it('the vendored fixture rejects at least the six spec rule-2 keys', () => {
+    expect(reserved.map((v) => v.key)).toEqual(
+      expect.arrayContaining(['', '.', '..', 'health', 'ttl', 'lock'])
+    );
+    expect(transmittable.length).toBeGreaterThan(0);
   });
 
   it.each(reserved)('encodeKey($key) throws ConfigurationError', ({ key }) => {
@@ -140,37 +147,6 @@ describe('rule 2 — reserved segments are rejected before the URL is built', ()
         expect(h.fetchSpy).not.toHaveBeenCalled();
       }
     );
-  });
-});
-
-describe('empty-key precondition — rejected before the URL is built (no shared fixture vector yet)', () => {
-  // The empty key is the same CWE-22 escape class as the `.`/`..` reject rows —
-  // `/v1/cache/${''}` collapses to the `/v1/cache/` collection path — but it is
-  // not yet a row in the vendored cross-SDK fixture, so it is enforced here as a
-  // local precondition guard rather than claimed as a spec rule-2 vector. Adding
-  // the empty-key reject row to protocol/test-vectors/path-encoding.json (and
-  // re-vendoring) is tracked as cross-SDK parity follow-up.
-  it('the platform premise: an empty segment collapses to the collection path', () => {
-    expect(new URL(`${BASE}${PREFIX}${encodeURIComponent('')}`).pathname).toBe(PREFIX);
-  });
-
-  it('encodeKey("") throws ConfigurationError', () => {
-    expect(() => encodeKey('')).toThrow(ConfigurationError);
-  });
-
-  it('validateKey("") throws on the core and both wrappers', () => {
-    const h = harness();
-    for (const backend of [h.core, h.ttl, h.lock]) {
-      expect(() => backend.validateKey('')).toThrow(ConfigurationError);
-    }
-  });
-
-  describe.each(Object.entries(OPERATIONS))('%s', (_name, op) => {
-    it('rejects "" with ConfigurationError and never calls fetch', async () => {
-      const h = harness();
-      await expect(op.run(h, '')).rejects.toBeInstanceOf(ConfigurationError);
-      expect(h.fetchSpy).not.toHaveBeenCalled();
-    });
   });
 });
 
