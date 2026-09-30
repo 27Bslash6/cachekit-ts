@@ -1,4 +1,6 @@
 import { describe, it, expect, assert, beforeEach, afterEach, vi } from 'vitest';
+import { decode as msgpackDecode, encode as msgpackEncode } from '@msgpack/msgpack';
+import { ByteStorage } from '@cachekit-io/cachekit-core-ts';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -665,7 +667,7 @@ describe('Cache Integration', () => {
       async function readerOver(
         stored: Uint8Array,
         compression: boolean,
-        codec: ByteStorageLike,
+        codec?: ByteStorageLike, // omitted: the real core codec
         serializer?: { maxDecodedSize: number }
       ) {
         const backend = new InMemoryBackend();
@@ -681,6 +683,7 @@ describe('Cache Integration', () => {
           byteStorage: ByteStorageLike | null;
           createByteStorage: () => ByteStorageLike;
         };
+        if (codec === undefined) return reader;
         if (compression) impl.byteStorage = codec;
         impl.createByteStorage = () => codec;
         return reader;
@@ -919,8 +922,9 @@ describe('Cache Integration', () => {
       });
 
       it('never unpacks bytes that only pass the one-byte sniff', async () => {
-        // A plain user value that passes looksLikeEnvelope's fixarray(4)+bin
-        // sniff, but whose [1] is not a checksum: the header read rules it out.
+        // A plain user value that passes looksLikeEnvelope's fixarray(4) sniff
+        // with a bin [0], but whose [1] is not a checksum: the header read
+        // rules it out.
         const plain = new MessagePackSerializer().encode([new Uint8Array([1]), 'x', 3, 'y']);
         const { codec, calls } = spyCodec();
         const reader = await readerOver(plain, false, codec);
@@ -928,6 +932,102 @@ describe('Cache Integration', () => {
         expect(await reader.get('test:ceiling')).toEqual([new Uint8Array([1]), 'x', 3, 'y']);
         expect(calls.unpack).toBe(0);
         await reader.close();
+      });
+
+      it('rejects an oversized plain 4-tuple as too large, never unpacking it', async () => {
+        // Every fixarray(4) value reaches envelopeVerdict now; one longer than
+        // any envelope within the ceiling fails there, with the same error a
+        // plain decode over maxDecodedSize would give.
+        const plain = new MessagePackSerializer().encode(['x'.repeat(3000), 1, 2, 3]);
+        const { codec, calls } = spyCodec();
+        const reader = await readerOver(plain, false, codec, { maxDecodedSize: 1000 });
+
+        await expect(reader.get('test:ceiling')).rejects.toThrow(ValueTooLargeError);
+        expect(calls.unpack).toBe(0);
+        await reader.close();
+      });
+
+      describe('legacy (array-of-ints) envelopes, as published 0.1.5 writes them', () => {
+        it('reads a fixarray-encoded legacy envelope back as its value', async () => {
+          // The exact bytes published @cachekit-io/cachekit-core-wasm 0.1.1
+          // packs for { data: 'legacy' }: compressed_data is fixarray(14).
+          const stored = Buffer.from(
+            '949eccd0cc81cca464617461cca66c65676163799847cca5ccbf281e65ccbaccad0da76d73677061636b', // pragma: allowlist secret
+            'hex'
+          );
+          expect(stored[1]).toBe(0x9e);
+          const reader = await readerOver(new Uint8Array(stored), false);
+
+          expect(await reader.get('test:ceiling')).toEqual({ data: 'legacy' });
+          await reader.close();
+        });
+
+        it('reads an array16-encoded legacy envelope back as its value', async () => {
+          const value = { data: 'a legacy envelope with more than fifteen compressed bytes' };
+          // Today's bin-form envelope, re-encoded with compressed_data as ints.
+          const binForm = new ByteStorage().pack(new MessagePackSerializer().encode(value));
+          const [data, checksum, size, format] = msgpackDecode(binForm) as [
+            Uint8Array,
+            number[],
+            number,
+            string,
+          ];
+          const stored = msgpackEncode([Array.from(data), checksum, size, format]);
+          expect([stored[0], stored[1]]).toEqual([0x94, 0xdc]);
+          const reader = await readerOver(stored, false);
+
+          expect(await reader.get('test:ceiling')).toEqual(value);
+          await reader.close();
+        });
+
+        it('still reads a plain legacy-shaped 4-tuple that core rejects as itself', async () => {
+          // Passes the header read and envelopeVerdict, so it reaches the real
+          // unpack — which rejects [1, 2, 3] as an LZ4 block for 3 bytes.
+          const logs: string[] = [];
+          setLogger((message) => logs.push(message));
+          try {
+            const value = [[1, 2, 3], [1, 2, 3, 4, 5, 6, 7, 8], 3, 'msgpack'];
+            const reader = await readerOver(new MessagePackSerializer().encode(value), false);
+
+            expect(await reader.get('test:ceiling')).toEqual(value);
+            expect(logs.filter((m) => m.includes('failed verified unpack'))).toHaveLength(1);
+            await reader.close();
+          } finally {
+            setLogger(null);
+          }
+        });
+
+        it('never unpacks a legacy-shaped 4-tuple whose [1] is not a checksum', async () => {
+          const value = [[1, 2, 3], 'x', 3, 'y'];
+          const { codec, calls } = spyCodec();
+          const reader = await readerOver(new MessagePackSerializer().encode(value), false, codec);
+
+          expect(await reader.get('test:ceiling')).toEqual(value);
+          expect(calls.unpack).toBe(0);
+          await reader.close();
+        });
+
+        it('refuses (known loss) a plain value indistinguishable from an oversized legacy envelope', async () => {
+          // Legacy twin of the bin-form known loss above: under the 1000:1 cap
+          // and over a lowered ceiling, so only decompressing could tell it apart.
+          const value = [
+            Array.from({ length: 9_000 }, (_, i) => i % 256),
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            9_000_000,
+            'x',
+          ];
+          const reader = await readerOver(
+            new MessagePackSerializer().encode(value),
+            false,
+            undefined,
+            {
+              maxDecodedSize: 1024 * 1024,
+            }
+          );
+
+          await expect(reader.get('test:ceiling')).rejects.toThrow(ValueTooLargeError);
+          await reader.close();
+        });
       });
     });
   });
