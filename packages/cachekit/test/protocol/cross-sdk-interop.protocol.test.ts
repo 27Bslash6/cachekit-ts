@@ -14,6 +14,7 @@
 
 import { describe, it, expect, beforeAll } from 'vitest';
 import {
+  deriveKey,
   deriveTenantKeys,
   encryptWithTenantKeys,
   decryptWithTenantKeys,
@@ -110,6 +111,17 @@ function buildAAD(
   return aad;
 }
 
+// LAB-7084: every byte-returning export hands back a plain Uint8Array (not a
+// Buffer, whose .slice and toJSON differ) that owns its whole ArrayBuffer. The
+// L1 ciphertext guard (cache-core l1Payload) stores without copying only when
+// the result owns its whole ArrayBuffer, so a pooled or offset view must never
+// come back. Byte checks against fixtures catch an unfilled copy.
+function expectOwnedCopy(bytes: Uint8Array): void {
+  expect(bytes.constructor).toBe(Uint8Array);
+  expect(bytes.byteOffset).toBe(0);
+  expect(bytes.byteLength).toBe(bytes.buffer.byteLength);
+}
+
 describe('Cross-SDK Interoperability (Python <-> TypeScript)', () => {
   let tsKeys: TenantKeys;
 
@@ -122,6 +134,7 @@ describe('Cross-SDK Interoperability (Python <-> TypeScript)', () => {
   describe('Key derivation compatibility', () => {
     it('produces same key fingerprint as Python', () => {
       const tsFingerprint = tsKeys.encryptionFingerprint();
+      expectOwnedCopy(tsFingerprint);
       const expectedFingerprint = hexToBytes(PYTHON_FIXTURES.keyFingerprintHex);
 
       expect(bytesToHex(tsFingerprint)).toBe(PYTHON_FIXTURES.keyFingerprintHex);
@@ -155,6 +168,7 @@ describe('Cross-SDK Interoperability (Python <-> TypeScript)', () => {
         // Decrypt Python's ciphertext using TypeScript
         const decrypted = decryptWithTenantKeys(pythonCiphertext, aad, tsKeys);
 
+        expectOwnedCopy(decrypted);
         expect(bytesToHex(decrypted)).toBe(vector.plaintextHex);
         expect(Array.from(decrypted)).toEqual(Array.from(expectedPlaintext));
       });
@@ -194,6 +208,7 @@ describe('Cross-SDK Interoperability (Python <-> TypeScript)', () => {
 
       // Encrypt with TypeScript
       const ciphertext = encryptWithTenantKeys(plaintext, aad, tsKeys);
+      expectOwnedCopy(ciphertext);
 
       // Decrypt with TypeScript (simulating Python with same Rust core)
       const decrypted = decryptWithTenantKeys(ciphertext, aad, tsKeys);
@@ -340,6 +355,38 @@ const PYTHON_COMPRESSED_FIXTURE = {
     ciphertextHex: '44cc06e600000000000000000eb8450c4aac2337265323f7f1b03fc3966deaa515f7',
   },
 };
+
+// Paths the fixture tests above do not reach. Those tests also assert ownership.
+describe('NAPI byte results are owned Uint8Array copies', () => {
+  const masterKey = hexToBytes(PYTHON_FIXTURES.masterKeyHex);
+
+  it('decryptWithTenantKeys returns an owned Uint8Array on the keyring path', () => {
+    const rotating = deriveTenantKeys(new Uint8Array(32).fill(0x62), PYTHON_FIXTURES.tenantId, [
+      masterKey,
+    ]);
+    const vector = PYTHON_FIXTURES.vectors[0]!;
+    const plaintext = decryptWithTenantKeys(
+      hexToBytes(vector.ciphertextHex),
+      hexToBytes(vector.aadHex),
+      rotating
+    );
+    expectOwnedCopy(plaintext);
+    expect(bytesToHex(plaintext)).toBe(vector.plaintextHex);
+  });
+
+  // No fixture pins deriveKey output, so guard the copy itself: an unfilled
+  // copy is deterministic and 32 bytes long, but all zeros and domain-blind.
+  it('deriveKey returns a deterministic, domain-separated 32-byte key', () => {
+    const a = deriveKey(masterKey, 'cachekit:encryption', 'tenant-123');
+    const b = deriveKey(masterKey, 'cachekit:encryption', 'tenant-123');
+    const other = deriveKey(masterKey, 'cachekit:authentication', 'tenant-123');
+    expectOwnedCopy(a);
+    expect(a.length).toBe(32);
+    expect(a.some((byte) => byte !== 0)).toBe(true);
+    expect(bytesToHex(a)).toBe(bytesToHex(b));
+    expect(bytesToHex(a)).not.toBe(bytesToHex(other));
+  });
+});
 
 describe('Python AAD Format Verification', () => {
   /**
