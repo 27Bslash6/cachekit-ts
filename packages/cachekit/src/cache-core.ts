@@ -267,24 +267,11 @@ export class CacheImpl implements SecureCache {
   private readonly lockable: LockableBackend | null;
 
   constructor(options: CacheOptions, runtime: CacheRuntime) {
-    // Initialize backend. The telemetry getter reads `this` lazily (per
-    // request), so constructor field order is safe.
-    this.backend = runtime.resolveBackend(options.backend, options.stampede, () => ({
-      ...this.telemetry,
-      l1Enabled: this.l1 !== null,
-    }));
-
-    // Initialize metrics (Prometheus via the runtime; no-op when the
-    // platform has no collector or metrics are off)
-    const metricsOption = options.metrics ?? false;
-    this.metrics =
-      metricsOption !== false && runtime.createMetrics
-        ? runtime.createMetrics(typeof metricsOption === 'object' ? metricsOption : undefined)
-        : NOOP_METRICS;
-
-    // Stampede config + lock capability. Duck-typed like cachekit-py's
-    // hasattr check: user-supplied Backend instances aren't required to
-    // declare the LockableBackend interface, only to implement it.
+    // Every config check that can throw ConfigurationError runs before
+    // resolveBackend: a URL config opens a reconnecting Redis client there, and
+    // a throw after that point would leak it to a caller who catches the error.
+    // The one exception is the distributedLock check below, which needs the
+    // backend instance.
     this.stampede = {
       distributedLock: options.stampede?.distributedLock ?? false,
       lockTimeoutMs: options.stampede?.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS,
@@ -306,6 +293,41 @@ export class CacheImpl implements SecureCache {
         `stampede.lockWaitMs must be >= 0, got ${this.stampede.lockWaitMs}`
       );
     }
+
+    if (options.invalidation && !runtime.createInvalidationChannel) {
+      throw new ConfigurationError(
+        'Cross-instance invalidation is not supported in this runtime ' +
+          '(Redis Pub/Sub requires Node — remove the invalidation option)'
+      );
+    }
+
+    // Initialize encryption (its key checks throw ConfigurationError)
+    this.encryption = options.encryption ? runtime.createEncryption(options.encryption) : null;
+
+    // Initialize serializer (its bound checks throw ConfigurationError)
+    this.serializer = new MessagePackSerializer(options.serializer);
+
+    // Initialize backend. The telemetry getter reads `this` lazily (per
+    // request), so constructor field order is safe.
+    this.backend = runtime.resolveBackend(options.backend, options.stampede, () => ({
+      ...this.telemetry,
+      l1Enabled: this.l1 !== null,
+    }));
+
+    // Initialize metrics (Prometheus via the runtime; no-op when the
+    // platform has no collector or metrics are off)
+    const metricsOption = options.metrics ?? false;
+    this.metrics =
+      metricsOption !== false && runtime.createMetrics
+        ? runtime.createMetrics(typeof metricsOption === 'object' ? metricsOption : undefined)
+        : NOOP_METRICS;
+
+    // Lock capability. Duck-typed like cachekit-py's hasattr check:
+    // user-supplied Backend instances aren't required to declare the
+    // LockableBackend interface, only to implement it. On Node, URL and apiKey
+    // configs resolve to lock-capable backends, so the distributedLock check
+    // cannot fire for them. On Workers, apiKey resolves to a lockless fetch
+    // backend that holds no connection, so throwing here leaks nothing.
     const maybeLockable = this.backend as Partial<LockableBackend>;
     this.lockable =
       typeof maybeLockable.acquireLock === 'function' &&
@@ -339,9 +361,6 @@ export class CacheImpl implements SecureCache {
     this.backgroundRefresh = new BackgroundRefreshManager();
     this.swrRequiresWaitUntil = runtime.swrRequiresWaitUntil ?? false;
 
-    // Initialize encryption
-    this.encryption = options.encryption ? runtime.createEncryption(options.encryption) : null;
-
     // Initialize ByteStorage (LZ4 compression + xxHash3-64 integrity). The
     // default honors the backend's advertised preference (LAB-1388), else
     // true. An explicit option wins.
@@ -352,20 +371,11 @@ export class CacheImpl implements SecureCache {
     // enveloped entry.
     this.createByteStorage = () => runtime.createByteStorage();
 
-    // Initialize serializer
-    this.serializer = new MessagePackSerializer(options.serializer);
-
     // Default TTL
     this.defaultTtl = options.defaultTtl ?? DEFAULT_TTL_SECONDS;
 
     // m1 Fix: Initialize invalidation channel if config provided
-    if (options.invalidation) {
-      if (!runtime.createInvalidationChannel) {
-        throw new ConfigurationError(
-          'Cross-instance invalidation is not supported in this runtime ' +
-            '(Redis Pub/Sub requires Node — remove the invalidation option)'
-        );
-      }
+    if (options.invalidation && runtime.createInvalidationChannel) {
       this.invalidationChannel = this.initializeInvalidationChannel(
         options.invalidation,
         runtime.createInvalidationChannel
