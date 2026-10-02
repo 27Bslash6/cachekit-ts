@@ -354,6 +354,29 @@ and distinct-key miss floods are already bounded by backend timeouts plus the
 circuit breaker. A global semaphore would add queueing latency without a
 failure mode it prevents.
 
+## Cross-SDK interop mode
+
+Interop mode lets this SDK share cache entries with the Python and Rust SDKs.
+Opt in per function with the paired `interop` (operation name) and
+`interopArity` (exact argument count) options on `cache.wrap()`. The
+cross-SDK rules — what composes with interop, the argument-list contract, and
+the shared-entry contract — are in the
+[Using Interop Mode](https://docs.cachekit.io/concepts/using-interop-mode/)
+guide on docs.cachekit.io, with the
+[interop/v1 spec](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md)
+as the normative reference. Both win over this README on any conflict.
+
+> [!WARNING]
+> Every service that binds one `(namespace, operation)` must agree on
+> encryption: on in all of them or off in all of them, with the same
+> `masterKey` and `tenantId` (the decrypt-only `previousMasterKeys` may
+> differ). If an unencrypted service shares the operation with an encrypted
+> one, values end up **stored unencrypted** at the shared key: the unencrypted
+> service writes in the clear whenever it fills the entry, and unless it fails
+> closed (`reliability.degradation: false` in this SDK) it also replaces
+> ciphertext it cannot decode. See
+> [Shared entries are a contract](https://docs.cachekit.io/concepts/using-interop-mode/#shared-entries-are-a-contract).
+
 ## Backends
 
 Four backends implement the same `Backend` interface (raw bytes in/out) and plug into `createCache({ backend })` interchangeably:
