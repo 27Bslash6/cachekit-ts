@@ -1,30 +1,41 @@
 #!/usr/bin/env bash
-# Regression fixtures for the runner drift guard (the awk program in the
-# runner-drift-guard job of .github/workflows/ci.yml). Every `bad` fixture must
-# exit 1 with a ::error line, and when it lists lines, its errors must fall on
-# exactly those lines; every `good` fixture must exit 0. Each fixture also runs
-# with CRLF line endings and must get the same verdict. Structural `bad`
-# fixtures carry only hosted labels, so nothing but the shape under test can
-# fail them. A fixture named <name>/build-native is written as
-# build-native.yml. Add the shape here when you close a hole.
+# Regression fixtures for the runner drift guard (the awk program and the scan
+# driver in the runner-drift-guard job of .github/workflows/ci.yml). Every `bad`
+# fixture must exit 1 with ::error lines; when it lists lines, its errors must
+# fall on exactly those lines, and when it gives text, every error must hold it.
+# Every `good` fixture must exit 0. Each program fixture also runs with CRLF
+# line endings and must get the same verdict. Structural `bad` fixtures carry
+# only hosted labels, so nothing but the shape under test can fail them. Add
+# the shape here when you close a hole.
 #
-#   CI:     bash .github/scripts/runner-drift-guard-selftest.sh "$RUNNER_TEMP/runner-drift-guard.awk"
-#   Local:  bash .github/scripts/runner-drift-guard-selftest.sh   (extracts the program from ci.yml)
+#   CI:     bash .github/scripts/runner-drift-guard-selftest.sh "$RUNNER_TEMP/runner-drift-guard.awk" "$RUNNER_TEMP/runner-drift-guard-scan.sh"
+#   Local:  bash .github/scripts/runner-drift-guard-selftest.sh   (extracts both from ci.yml)
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
+extract() { sed -n "/<<'$1'\$/,/^ *$1\$/p" .github/workflows/ci.yml | sed '1d;$d'; }
 prog=${1:-}
-if [ -z "$prog" ]; then
-  prog=$tmp/runner-drift-guard.awk
-  sed -n "/<<'AWK'\$/,/^ *AWK\$/p" .github/workflows/ci.yml | sed '1d;$d' > "$prog"
-fi
+scan=${2:-}
+if [ -z "$prog" ]; then prog=$tmp/runner-drift-guard.awk; extract AWK > "$prog"; fi
+if [ -z "$scan" ]; then scan=$tmp/runner-drift-guard-scan.sh; extract SCAN > "$scan"; fi
 [ -s "$prog" ] || { echo "::error::guard program not found: ${prog}"; exit 1; }
+[ -s "$scan" ] || { echo "::error::guard scan driver not found: ${scan}"; exit 1; }
 fail=0
 
-check() { # kind name body [lines]
+verdict() { # kind name [lines] [text], judging $rc and $out
+  got=$(sed -n 's/^::error file=[^,]*,line=\([0-9]*\)::.*/\1/p' <<<"$out" | sort -nu | xargs)
+  case "$1" in
+    bad)  [ "$rc" -eq 1 ] && grep -q '^::error' <<<"$out" && [ "${3:-$got}" = "$got" ] &&
+            ! grep '^::error' <<<"$out" | grep -qvF -- "${4:-::error}" && return 0 ;;
+    good) [ "$rc" -eq 0 ] && return 0 ;;
+  esac
+  printf '::error::selftest %s %s: exit %s, error lines [%s], expected [%s]%s\n%s\n' \
+    "$1" "$2" "$rc" "$got" "${3:-any}" "${4:+, each holding \"$4\"}" "$out"
+  return 1
+}
+check() { # kind name body [lines] [text]
   f=$tmp/$2.yml
-  mkdir -p "${f%/*}"
   printf '%s\n' "$3" > "$f"
   for eol in LF CRLF; do
     # awk, not sed -i: BSD sed reads -i's next word as a backup suffix.
@@ -32,27 +43,20 @@ check() { # kind name body [lines]
       echo "::error::selftest $1 $2: cannot write the CRLF fixture"; exit 1
     fi
     out=$(awk -f "$prog" "$f" 2>&1); rc=$?
-    got=$(sed -n 's/^::error file=[^,]*,line=\([0-9]*\)::.*/\1/p' <<<"$out" | sort -nu | xargs)
-    case "$1" in
-      bad)  [ "$rc" -eq 1 ] && [ -n "$got" ] && [ "${4:-$got}" = "$got" ] && continue ;;
-      good) [ "$rc" -eq 0 ] && continue ;;
-    esac
-    printf '::error::selftest %s %s (%s): exit %s, error lines [%s], expected [%s]\n%s\n' \
-      "$1" "$2" "$eol" "$rc" "$got" "${4:-any}" "$out"
-    fail=1
+    verdict "$1" "$2 ($eol)" "${4:-}" "${5:-}" || fail=1
   done
 }
 bad()  { check bad  "$@"; }
 good() { check good "$@"; }
 
 # --- label policy ----------------------------------------------------------
-bad pool-label            $'jobs:\n  j:\n    runs-on: build-pool'
+bad pool-label            $'jobs:\n  j:\n    runs-on: build-pool' 3 'to HOSTED'
 bad hosted-prefix-pool    $'jobs:\n  j:\n    runs-on: ubuntu-pool'
 bad unlisted-hosted-arm   $'jobs:\n  j:\n    runs-on: ubuntu-24.04-arm'
 bad self-hosted-list      $'jobs:\n  j:\n    runs-on: [self-hosted, linux]'
-bad vars-indirection      $'jobs:\n  j:\n    runs-on: ${{ vars.RUNNER }}'
+bad vars-indirection      $'jobs:\n  j:\n    runs-on: ${{ vars.RUNNER }}' 3 'not a plain label'
 bad matrix-os-or          $'jobs:\n  j:\n    runs-on: ${{ matrix.os || \'build-pool\' }}' 3
-bad other-matrix-key      $'jobs:\n  j:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [ubuntu-latest]'
+bad other-matrix-key      $'jobs:\n  j:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [ubuntu-latest]' 3 'not a plain label'
 bad matrix-os-pool        $'jobs:\n  j:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest, build-pool]'
 bad matrix-runner-pool    $'jobs:\n  j:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        runner: [build-pool]'
 bad matrix-include-item   $'jobs:\n  j:\n    strategy:\n      matrix:\n        include:\n          - os: build-pool\n            node: 24'
@@ -62,7 +66,7 @@ bad quoted-key-os         $'jobs:\n  j:\n    strategy:\n      matrix:\n        \
 bad upper-key             $'jobs:\n  j:\n    strategy:\n      matrix:\n        OS: [build-pool]\n    runs-on: ${{ matrix.os }}'
 bad hash-in-plain-scalar  $'jobs:\n  j:\n    runs-on: ubuntu-latest#pool'
 # --- values not written inline (hosted labels: only the shape fails) --------
-bad block-form            $'jobs:\n  j:\n    runs-on:\n      group: some-group\n      labels: [ubuntu-latest]'
+bad block-form            $'jobs:\n  j:\n    runs-on:\n      group: some-group\n      labels: [ubuntu-latest]' 3 'not whole on this line'
 bad block-sequence        $'jobs:\n  j:\n    runs-on:\n      - ubuntu-latest'
 bad prettier-wrapped-list $'jobs:\n  j:\n    runs-on:\n      [\n        ubuntu-latest,\n      ]'
 bad hand-wrapped-list     $'jobs:\n  j:\n    runs-on: [\n      ubuntu-latest]'
@@ -73,7 +77,7 @@ bad literal-scalar        $'jobs:\n  j:\n    runs-on: |\n      ubuntu-latest'
 bad wrapped-expression    $'jobs:\n  j:\n    runs-on: ${{ github.event.pull_request.head.repo.fork &&\n      \'ubuntu-latest\' || \'macos-latest\' }}'
 bad wrapped-plain-scalar  $'jobs:\n  j:\n    runs-on: ubuntu-latest\n      macos-latest' 4
 bad wrapped-include-item  $'jobs:\n  j:\n    strategy:\n      matrix:\n        include:\n          - os: ubuntu-latest\n              macos-latest\n            node: 24' 7
-bad hash-in-quoted-scalar $'jobs:\n  j:\n    runs-on: "ubuntu-latest #pool"'
+bad hash-in-quoted-scalar $'jobs:\n  j:\n    runs-on: "ubuntu-latest #pool"' 3 'not whole on this line'
 # --- lines that may hide a runner label (hosted labels: only the shape fails)
 bad flow-style-job        'jobs: {j: {runs-on: ubuntu-latest}}'
 bad flow-strategy         $'jobs:\n  j:\n    strategy: {fail-fast: false, matrix: {os: [ubuntu-latest]}}'
@@ -104,75 +108,34 @@ bad include-alias         $'x: &inc\n  - os: ubuntu-latest\njobs:\n  j:\n    str
 bad alias-item            $'x: &item\n  os: ubuntu-latest\njobs:\n  j:\n    strategy:\n      matrix:\n        include:\n          - *item'
 bad merge-key             $'jobs:\n  j:\n    strategy:\n      matrix:\n        <<: *shared'
 bad external-reusable     $'jobs:\n  j:\n    uses: other-org/tooling/.github/workflows/build.yml@main'
+bad external-reusable-quoted-key $'jobs:\n  j:\n    "uses": other-org/tooling/.github/workflows/build.yml@main' 3
+bad external-reusable-next-line $'jobs:\n  j:\n    uses:\n      other-org/tooling/.github/workflows/build.yml@main' 3
+bad external-reusable-folded $'jobs:\n  j:\n    uses: >-\n      other-org/tooling/.github/workflows/build.yml@main' 3
+bad external-reusable-literal $'jobs:\n  j:\n    uses: |-\n      other-org/tooling/.github/workflows/build.yml@main' 3
+bad external-reusable-flow-job $'jobs:\n  j: {uses: other-org/tooling/.github/workflows/build.yml@main}' 2
+bad external-reusable-open-quote $'jobs:\n  j:\n    uses: "other-org/tooling/\\\n      .github/workflows/build.yml@main"' 3
+bad external-reusable-alias $'x: &w other-org/tooling/.github/workflows/build.yml@main\njobs:\n  j:\n    uses: *w' 4
 # --- a verdict never depends on a non-runner key: each pair differs only in
 # the sibling key, and both fail on the os line, never on the sibling's -----
 bad os-object-list-pkg    $'jobs:\n  j:\n    strategy:\n      matrix:\n        os:\n          - runner: ubuntu-latest\n            artifact: cachekit.linux-x64-gnu.node' 5
 bad os-object-list-other  $'jobs:\n  j:\n    strategy:\n      matrix:\n        os:\n          - runner: ubuntu-latest\n            artifact: other' 5
 bad os-item-sequence-pkg  $'jobs:\n  j:\n    strategy:\n      matrix:\n        include:\n          - os:\n              - ubuntu-latest\n            pkg: cachekit-core-ts' 6
 bad os-item-sequence-other $'jobs:\n  j:\n    strategy:\n      matrix:\n        include:\n          - os:\n              - ubuntu-latest\n            pkg: other' 6
-# --- build-native.yml's dynamic matrix: accepted only in that file's build
-# job, and only while every "os" its resolve job writes is a checked literal.
-# native <line> is build-native.yml cut down, with <line> as the resolve job's
-# push-branch assignment (line 12); the build job's include is on line 20.
-resolve_job=$(cat <<'YAML'
-  matrix:
-    runs-on: ubuntu-latest
-    outputs:
-      builds: ${{ steps.set.outputs.builds }}
-    steps:
-      - id: set
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            builds='[{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-latest"}]'
-          else
-            @BUILDS@
-          fi
-          echo "builds=$(echo "$builds" | tr -d '\n ')" >> "$GITHUB_OUTPUT"
-YAML
-)
-build_job=$(cat <<'YAML'
-  build:
-    needs: matrix
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.matrix.outputs.builds) }}
-    runs-on: ${{ matrix.os }}
-YAML
-)
-native() { printf 'jobs:\n%s\n%s' "${resolve_job/@BUILDS@/"$1"}" "$build_job"; }
-one=$'builds=\'[{"target":"x86_64-apple-darwin","os":"macos-latest"}]\''
-wrapped=$'builds=\'[\n              {"target":"x86_64-apple-darwin","os":"macos-latest"},\n              {"target":"x86_64-pc-windows-msvc", "os": "windows-latest"}\n            ]\''
-good dynamic-matrix/build-native             "$(native "$wrapped")"
-good dynamic-matrix-build-first/build-native "$(printf 'jobs:\n%s\n%s' "$build_job" "${resolve_job/@BUILDS@/"$one"}")"
-bad json-pool-label/build-native    "$(native $'builds=\'[{"target":"x","os":"build-pool"}]\'')" 12
-bad json-shell-var/build-native     "$(native $'builds=\'[{"target":"x","os":"\'"$RUNNER"\'"}]\'')" 12
-bad json-escaped-var/build-native   "$(native $'builds="[{\\"target\\":\\"x\\",\\"os\\":\\"$RUNNER\\"}]"')" 12
-bad json-jq-arg/build-native        "$(native $'builds=$(jq -nc --arg os "$RUNNER" \'[{target: "x", os: $os}]\')')" 12
-bad json-split-pair/build-native    "$(native $'builds=\'[{"target":"x","os":\n              "macos-latest"}]\'')" 12
-bad json-vars-expression/build-native "$(native $'builds=\'${{ vars.BUILD_MATRIX }}\'')" 12
-bad json-file-read/build-native     "$(native $'builds=$(cat build-matrix.json)')" 12
-bad json-env-variable/build-native  "$(native $'builds="$BUILD_MATRIX"')" 12
-bad json-no-literal/build-native    "jobs:"$'\n  matrix:\n    runs-on: ubuntu-latest\n    outputs:\n      builds: ${{ steps.set.outputs.builds }}\n    steps:\n      - id: set\n        run: echo \'builds=[{"target":"x"}]\' >> "$GITHUB_OUTPUT"\n'"$build_job" "8 14"
-bad dynamic-other-job/build-native  "$(native "$one")"$'\n'"${build_job/build:/build2:}" 27
-bad dynamic-other-output/build-native "$(s=$(native "$one"); printf '%s' "${s/needs.matrix.outputs.builds/needs.matrix.outputs.extra}")" 20
-bad dynamic-other-workflow          "$(native "$one")" "10 12 20"
-env_step=$'        env:\n          BASH_ENV: .github/m.sh\n        run: |'
-bad json-read-file/build-native     "$(native 'read -r builds < build-matrix.json')" 12
-bad json-extra-output/build-native  "$(native "$one"$'\n            node scripts/gen-matrix.js >> "$GITHUB_OUTPUT"')" 13
-bad json-step-env/build-native      "$(s=$(native "$one"); printf '%s' "${s/        run: |/"$env_step"}")" "8 9"
-bad json-hash-in-literal/build-native "$(native $'builds=\'[{"target":"#","os":"build-pool"}]\'')" 12
-bad json-hash-escaped-var/build-native "$(native $'builds="[{\\"target\\":\\"#\\",\\"os\\":\\"$RUNNER\\"}]"')" 12
-bad json-hash-line-in-literal/build-native "$(native $'builds=\'[\n              # {"target":"x","os":"build-pool"}\n              {"target":"x","os":"macos-latest"}]\'')" 13
-bad json-escaped-key/build-native   "$(native $'builds=\'[{"target":"x","\\u006fs":"build-pool"}]\'')" 12
-bad json-name-in-run/build-native   "$(native "$one"$'\n            name: || echo "builds=$(cat build-matrix.json)" >> "$GITHUB_OUTPUT"')" 13
-unclosed=$'jobs:\n  matrix:\n    runs-on: ubuntu-latest\n    outputs:\n      builds: ${{ steps.set.outputs.builds }}\n    steps:\n      - run: |\n          builds=\'[{"target":"x","os":"macos-latest"}]\n        continue-on-error: true\n      - id: set\n        uses: some-org/matrix-action@v1\n'
-bad json-unclosed-literal/build-native "$unclosed$build_job" "9 11"
-yaml_comments=$(s=$(native "$one"); s=${s/    runs-on: ubuntu-latest/    runs-on: ubuntu-latest  # hosted}; s=${s/    outputs:/    outputs:  # read by build}
-  s=${s/      - id: set/      - id: set  # step}; printf '%s' "${s/        run: |/        run: |  # PRs: linux only}")
-good resolve-yaml-comments/build-native "$yaml_comments"
-bad json-run-in-name/build-native   "${unclosed/      - run: |/      - name: x run: |}$build_job" "8 9 11 17"
-good resolve-job-comments/build-native "$(native $'# don\'t read this list from a file\n            '"$one")"
+# --- a matrix read from another job's output fails like any expression-set
+# matrix, in build-native.yml too
+bad build-native          $'jobs:\n  build:\n    needs: matrix\n    strategy:\n      fail-fast: false\n      matrix:\n        include: ${{ fromJSON(needs.matrix.outputs.builds) }}\n    runs-on: ${{ matrix.os }}' 7
+# --- HOSTED is a set of exact labels: one that contains or extends a hosted
+# label fails, with the advice to add it to HOSTED
+bad hosted-label-suffix   $'jobs:\n  j:\n    runs-on: ubuntu-latest-x' 3 'to HOSTED'
+bad hosted-label-prefix   $'jobs:\n  j:\n    runs-on: my-ubuntu-latest' 3 'to HOSTED'
+bad matrix-hosted-suffix  $'jobs:\n  j:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [macos-latest, ubuntu-latest-x]' 6 'to HOSTED'
+# --- a line that continues a flow collection or quoted scalar left open inside
+# a strategy block ends no block, however far it is dedented
+bad open-flow-list-dedent $'jobs:\n  j:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        foo: [a,\n    b]\n        os: [self-hosted]' 8
+bad open-single-quote-dedent $'jobs:\n  j:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        foo: \'a\n    b\'\n        os: [self-hosted]' 8
+bad open-double-quote-dedent $'jobs:\n  j:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        foo: "a\n    b"\n        os: [self-hosted]' 8
+bad open-flow-map-dedent  $'jobs:\n  j:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        foo: {a: 1,\n    b: 2}\n        os: [self-hosted]' 8
+bad open-anchored-flow-dedent $'jobs:\n  j:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        foo: &x [a,\n    b]\n        os: [self-hosted]' 8
 # --- must pass --------------------------------------------------------------
 good ubuntu-latest        $'jobs:\n  j:\n    runs-on: ubuntu-latest'
 good upper-hosted-label   $'jobs:\n  j:\n    runs-on: Ubuntu-Latest'
@@ -194,6 +157,41 @@ good markdown-bullets     $'jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\
 good job-anchor           $'jobs:\n  a: &job\n    runs-on: ubuntu-latest\n  b: *job'
 good job-named-matrix     $'jobs:\n  matrix:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          ${{ github.workspace }}/build.sh\n  strategy:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          ${{ github.workspace }}/check.sh'
 good with-matrix-expression $'jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: some/action@abc\n        with:\n          matrix:\n            ${{ vars.CONFIG }}'
+good quoted-step-uses     $'jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - "uses": \'actions/checkout@v4\''
+good closed-flow-then-dedent $'jobs:\n  j:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        foo: [a,\n          b]\n        os: [ubuntu-latest]\n    env:\n      os: linux\n    steps:\n      - run: echo ${{ matrix.foo }}'
+good apostrophe-in-matrix $'jobs:\n  j:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest]\n        note: [don\'t, it\'s]\n        name: it\'s fine\n    steps:\n      - run: echo ${{ matrix.note }}'
+good static-jobs-step-alias $'jobs:\n  build:\n    if: github.event_name != \'pull_request\'\n    strategy:\n      matrix:\n        include:\n          - target: x86_64-apple-darwin\n            os: macos-latest\n    runs-on: ${{ matrix.os }}\n    steps: &build-steps\n      - run: echo ${{ matrix.target }}\n  build-pr:\n    if: github.event_name == \'pull_request\'\n    strategy:\n      matrix:\n        include:\n          - target: x86_64-unknown-linux-gnu\n            os: ubuntu-latest\n    runs-on: ${{ matrix.os }}\n    steps: *build-steps'
+
+# --- the scan driver reads each workflow's committed bytes at HEAD -----------
+repo() { # name: an empty repository at $tmp/<name>, in $r
+  r=$tmp/$1
+  mkdir -p "$r/.github/workflows" && git -C "$r" -c init.defaultBranch=main init -q
+}
+commit() {
+  git -C "$r" add -A &&
+    git -C "$r" -c user.name=selftest -c user.email=selftest@invalid -c commit.gpgsign=false \
+      -c core.hooksPath=/dev/null commit -qm fixture
+}
+scanned() { # kind name [lines] [text]
+  out=$(cd "$tmp/$2" && TMPDIR=$tmp bash "$scan" "$prog" 2>&1); rc=$?
+  verdict "$1" "$2" "${3:-}" "${4:-}" || fail=1
+}
+pool=$'jobs:\n  j:\n    runs-on: build-pool'
+hosted=$'jobs:\n  j:\n    runs-on: ubuntu-latest'
+# A working-tree-encoding checkout is UTF-16, which hides every line from awk;
+# GitHub runs the UTF-8 blob.
+repo utf16 && printf '*.yml working-tree-encoding=UTF-16LE\n' > "$r/.gitattributes" &&
+  printf '%s\n' "$pool" | iconv -f UTF-8 -t UTF-16LE > "$r/.github/workflows/x.yml" && commit || exit 1
+if awk -f "$prog" "$r/.github/workflows/x.yml" > /dev/null; then scanned bad utf16 3
+else echo "::error::selftest scan utf16: the UTF-16LE checkout does not hide the label from awk, so this fixture tests nothing"; fail=1; fi
+repo dotfile && printf '%s\n' "$hosted" > "$r/.github/workflows/ci.yml" &&
+  printf '%s\n' "$pool" > "$r/.github/workflows/.hidden.yml" && commit || exit 1
+scanned bad dotfile 3
+repo symlink && printf '%s\n' "$pool" > "$r/pool.yml" && ln -s ../../pool.yml "$r/.github/workflows/x.yml" && commit || exit 1
+scanned bad symlink '' 'not a regular file'
+repo uncommitted && printf '%s\n' "$hosted" > "$r/.github/workflows/x.yml" && commit &&
+  printf '%s\n' "$pool" > "$r/.github/workflows/x.yml" || exit 1
+scanned good uncommitted
 
 if [ "$fail" -ne 0 ]; then echo "runner-drift-guard selftest FAILED"; exit 1; fi
-echo "runner-drift-guard selftest OK ($(grep -c '^bad ' "$0") bad, $(grep -c '^good ' "$0") good, each also as CRLF)"
+echo "runner-drift-guard selftest OK ($(grep -c '^bad ' "$0") bad, $(grep -c '^good ' "$0") good, each also as CRLF; $(grep -cE '(^|[[:space:]])scanned (bad|good) ' "$0") scan)"
