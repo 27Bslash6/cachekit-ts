@@ -10,8 +10,15 @@ This is the Workers sibling of
 Node): same pinned Rust crate, same API surface (`deriveTenantKeys`,
 `encryptWithTenantKeys`, `decryptWithTenantKeys`, `ByteStorage`), one
 deterministic `wasm32-unknown-unknown` target instead of a per-platform
-native matrix. The artifact is ~137 KB raw / ~55 KB gzipped plus ~10 KB of
-wasm-bindgen glue — about 2% of the free-plan Worker size budget.
+native matrix. The artifact is ~177 KB raw / ~64 KB gzipped plus ~26 KB of
+wasm-bindgen glue.
+
+It is built for speed, not size: `opt-level = 3` with wasm `simd128`
+(`.cargo/config.toml`) and `wasm-opt -O3`, for ~7 KB more gzip than a
+size-optimised build. In steady state, once V8 has tiered the module up to
+optimised code, LZ4 pack/unpack runs 2-4x and AES-256-GCM ~1.5x faster; the
+gain before tier-up is unmeasured. The runtime must support wasm SIMD, which
+workerd does.
 
 Most users never install this directly — it is a dependency of
 [`@cachekit-io/cachekit`](../cachekit)'s `/workers` entrypoint.
