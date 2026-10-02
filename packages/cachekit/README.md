@@ -519,8 +519,17 @@ for client-side validation failures (a value over the File or Memcached size
 limit, an out-of-range TTL) and for calls on a closed backend. So a run of keys
 the service rejects cannot open the breaker and cut off every other key.
 
+A read whose bytes arrive but will not decode is not a backend failure either.
+A decrypt or AAD failure (an entry written under a key no longer in
+`previousMasterKeys`, or under the other `compression` setting on a secure
+cache), a corrupt or foreign entry, or ciphertext over the size cap is fetched
+once and never retried, and it never counts toward the breaker, so a handful of
+undecodable entries cannot cut off every other key. It is still counted in
+`cachekit_errors_total` and as `cachekit_operations_total{operation="l2_decode",status="error"}`,
+and it resolves as a miss with degradation on and rejects with degradation off.
+
 Graceful degradation still applies: under `production`, `secure` and `io` these
-errors resolve as a miss or a no-op, and with
+`BackendError`s resolve as a miss or a no-op, and with
 `reliability: { degradation: false }` they reject with the `BackendError`. With
 degradation on, a revoked API key therefore turns L2 into misses at one request
 per operation rather than opening the breaker. A write that fails this way, or
